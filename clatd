@@ -1,4 +1,4 @@
-#! /usr/bin/perl -w
+#! /usr/bin/env -S perl -w
 #
 # Copyright (c) 2014-2023 Tore Anderson <tore@fud.no>
 #
