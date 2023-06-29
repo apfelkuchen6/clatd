@@ -25,8 +25,9 @@
 #
 use strict;
 use Net::IP;
+use JSON::PP;
 
-my $VERSION = "1.6";
+my $VERSION = "0.1";
 
 #
 # Populate the global config hash with the default values
@@ -36,24 +37,23 @@ $CFG{"quiet"} = 0;			# suppress normal output
 $CFG{"debug"} = 0;			# debugging output level
 $CFG{"script-up"} = undef;              # sh script to run when starting up
 $CFG{"script-down"} = undef;            # sh script to run when shutting down
-$CFG{"clat-dev"} = "clat";		# TUN interface name to use
+$CFG{"clat-dev"} = "clat";		# name of the host-side of the veth tunnel
+$CFG{"host-ll-addr"} = undef; # link local address used on the host side of the veth pair
+$CFG{"clat-ll-addr"} = undef; # link local address used on the clat side of the veth pair
+$CFG{"host-v4-addr"} = "192.0.0.2";	# from RFC 7335
 $CFG{"clat-v4-addr"} = "192.0.0.1";	# from RFC 7335
 $CFG{"clat-v6-addr"} = undef;		# derive from existing SLAAC addr
 $CFG{"dns64-servers"} = undef;		# use system resolver by default
 $CFG{"cmd-ip"} = "ip";			# assume in $PATH
 $CFG{"cmd-ip6tables"} = "ip6tables";	# assume in $PATH
-$CFG{"cmd-tayga"} = "tayga";		# assume in $PATH
+$CFG{"netns"} = "jooltest";  # network namespace the translation takes place in
 $CFG{"forwarding-enable"} = 1;		# enable ipv6 forwarding?
 $CFG{"ip6tables-enable"} = undef;	# allow clat<->plat traffic?
 $CFG{"plat-dev"} = undef;		# PLAT-facing device, default detect
 $CFG{"plat-prefix"} = undef;		# detect using DNS64 by default
 $CFG{"proxynd-enable"} = 1;		# add proxy-nd entry for clat?
-$CFG{"tayga-conffile"} = undef;		# make a temporary one by default
-$CFG{"tayga-v4-addr"} = "192.0.0.2";	# from RFC 7335
-$CFG{"v4-conncheck-enable"} = 1;	# exit if there's already a defroute
-$CFG{"v4-conncheck-delay"} = 10;	# seconds before checking for v4 conn.
+$CFG{"jool-conffile"} = undef;		# make a temporary one by default
 $CFG{"v4-defaultroute-enable"} = 1;	# add a v4 defaultroute via the CLAT?
-$CFG{"v4-defaultroute-replace"} = 0;	# replace existing v4 defaultroute?
 $CFG{"v4-defaultroute-metric"} = 2048;	# metric for the IPv4 defaultroute
 $CFG{"v4-defaultroute-mtu"} = 1260;	# MTU for the IPv4 defaultroute
 $CFG{"v4-defaultroute-advmss"} = 0;	# TCP MSS for the IPv4 defaultroute
@@ -78,6 +78,9 @@ sub err {
   print "<error> ", join("", @_), "\n" unless($CFG{"quiet"} >= 2);
   cleanup_and_exit(1);
 }
+sub x {
+  qx{@_}
+}
 
 
 #
@@ -97,7 +100,7 @@ sub cmd {
     } elsif($? & 127) {
       &{$msgsub}("cmd(@cmd) died with signal ", ($? & 127));
     } else {
-      &{$msgsub}("cmd(@cmd) returned ", ($? >> 127));
+      &{$msgsub}("cmd(@cmd) returned ", ($? >> 8));
     }
   }
   return $?;
@@ -550,17 +553,18 @@ sub get_clat_v6_addr {
     $mask = $mask->intip();
     $ip |= $mask;
   } else {
-    # If the chosen candidate IP is NOT EUI-64 based, we'll just make up a
-    # random interface ID. There is no guarantee that this will actually
-    # work, but it's the best thing we can try...
+    # If the chosen candidate IP is NOT EUI-64 based, we reuse the interface ID
+    # from the link-local address of the clat side of the veth pair.
+    # It might not work, but it's the best thing we can try...
 
-    # First zero out the entire Interface ID
-    $ip >>= (128-$ip_plen);
-    $ip <<= (128-$ip_plen);
+    my $mask = Net::IP->new("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")->intip();
+    # zero out the interface bits
+    $mask = ($mask >>= (128-$ip_plen)) <<= (128-$ip_plen);
 
-    my $iid = int(rand(2**(128-$ip_plen)));
-    d2(sprintf("Using random interface ID: %x", $iid));
-    $ip |= $iid;
+    my $ll = Net::IP->new(cfg("clat-ll-addr"), 6) or err(Net::IP::Error());
+    $ll = $ll->intip();
+
+    $ip = ($ip & $mask) | ($ll & ~$mask);
   }
 
   # Convert back the BigInt to a regular Net::IP object and return
@@ -571,63 +575,14 @@ sub get_clat_v6_addr {
 }
 
 #
-# This subroutine is called when we are exiting, for whatever reason. It
-# tries to clean up any temporary changes we've made first. The variables
-# below gets set as we go along, so that the cleanup subroutine can restore
-# stuff if necessary.
+# This subroutine is called when we are exiting prematurely, for whatever reason.
 #
-my $cleanup_remove_clat_dev;		# true if having created it
-my $cleanup_delete_taygaconf;		# true if having made a temp confile
-my $cleanup_zero_forwarding_sysctl;	# zero forwarding sysctl if set
-my @cleanup_accept_ra_sysctls;		# accept_ra sysctls to be reset to '1'
-my $cleanup_zero_proxynd_sysctl;	# zero proxy_ndp sysctl if set
-my $cleanup_remove_proxynd_entry,	# true if having added proxynd entry
-my $cleanup_remove_ip6tables_rules;	# true if having added ip6tables rules
-my @cleanup_restore_v4_defaultroutes;   # temporarily replaced defaultroutes
-
 sub cleanup_and_exit {
   my $exitcode = shift;
 
-  if(defined($cleanup_remove_clat_dev)) {
-    d("Cleanup: Removing CLAT device");
-    cmd(\&w, cfg("cmd-tayga"), "--config", cfg("tayga-conffile"), "--rmtun");
-  }
-  if(defined($cleanup_delete_taygaconf)) {
-    d("Cleanup: Deleting TAYGA config file '", cfg("tayga-conffile"), "'");
-    unlink(cfg("tayga-conffile"))
-      or w("unlink('", cfg("tayga-conffile"), "') failed");
-  }
-  if(defined($cleanup_zero_forwarding_sysctl)) {
-    d("Cleanup: Resetting forwarding sysctl to 0");
-    sysctl("net/ipv6/conf/all/forwarding", 0);
-  }
-  for my $sysctl (@cleanup_accept_ra_sysctls) {
-    d("Cleanup: Resetting $sysctl to 1");
-    sysctl($sysctl, 1);
-  }
-  if(defined($cleanup_zero_proxynd_sysctl)) {
-    d("Cleanup: Resetting proxy_ndp sysctl to 0");
-    sysctl("net/ipv6/conf/" . cfg("plat-dev") . "/proxy_ndp", 0);
-  }
-  if(defined($cleanup_remove_proxynd_entry)) {
-    d("Cleanup: Removing Proxy-ND entry for ", cfg("clat-v6-addr"), "on ",
-      cfg("plat-dev"));
-    cmd(\&w, cfg("cmd-ip"), qw(-6 neighbour delete proxy), cfg("clat-v6-addr"),
-        "dev", cfg("plat-dev"));
-  }
-  if(defined($cleanup_remove_ip6tables_rules)) {
-    d("Cleanup: Removing ip6tables rules allowing traffic between the CLAT ",
-      "and PLAT devices");
-    cmd(\&w, cfg("cmd-ip6tables"), qw(-D FORWARD -i), cfg("clat-dev"),
-        "-o", cfg("plat-dev"), qw(-j ACCEPT));
-    cmd(\&w, cfg("cmd-ip6tables"), qw(-D FORWARD -i), cfg("plat-dev"),
-        "-o", cfg("clat-dev"), qw(-j ACCEPT));
-  }
-  for my $rt (@cleanup_restore_v4_defaultroutes) {
-    d("Cleanup: Restoring temporarily replaced IPv4 default route");
-    cmd(\&w, cfg("cmd-ip"), qw(-4 route add), @{$rt});
-  }
-
+  p("Exiting...");
+  p("Removing network namespace " . cfg("netns") . ".");
+  cmd(\&w, cfg("cmd-ip"), qw(netns delete), cfg("netns"));
   exit($exitcode);
 }
 
@@ -713,7 +668,34 @@ for my $key (sort(keys(%CFG))) {
 p("Starting clatd v$VERSION by Tore Anderson <tore\@fud.no>");
 
 #
-# Step 1: Fill in any essential blanks in the configuration by auto-detecting
+# Setting up network namespace in which the translation will take place
+#
+if (system(cfg("cmd-ip") . " netns pids " . cfg("netns") . " > /dev/null 2>&1")) {
+  p("Adding new network namespace " . cfg("netns") . ".");
+  cmd(\&err, cfg("cmd-ip"), qw(netns add), cfg("netns"));
+  cmd(\&err, cfg("cmd-ip"), qw(link add name), cfg("clat-dev"), qw(type veth peer name to_world));
+  cmd(\&err, cfg("cmd-ip"), qw(link set dev), cfg("clat-dev"), qw(up));
+  cmd(\&err, cfg("cmd-ip"), qw(link set dev to_world), qw(up netns), cfg("netns"));
+} else {
+  p("Using existing network namespace " . cfg("netns") . ".");
+}
+
+# Configure link local addresses on the veth pair
+if (!defined($CFG{"host-ll-addr"})) {
+  chomp($CFG{"host-ll-addr"} = x(cfg("cmd-ip") . " -6 address show scope link dev " . cfg("clat-dev") . " | grep -Po 'inet6 \\K[0-9a-f:]+'"));
+} else {
+  # if this fails, the address is most likely™ already configured
+  cmd(\&w, cfg("cmd-ip"), " address add", cfg("host-ll-addr"), "scope link dev ", cfg("clat-dev"));
+}
+if (!defined($CFG{"clat-ll-addr"})) {
+  chomp($CFG{"clat-ll-addr"} = x(cfg("cmd-ip") . " -n " . cfg("netns") . " -6 address show scope link dev to_world | grep -Po 'inet6 \\K[0-9a-f:]+'"));
+} else {
+  # if this fails, the address is most likely™ already configured
+  cmd(\&w, cfg("cmd-ip"), "-n", cfg("netns"), "address add", cfg("host-ll-addr"), "scope link dev ", cfg("clat-dev"));
+};
+
+#
+# Fill in any essential blanks in the configuration by auto-detecting
 # any missing values.
 $CFG{"plat-prefix"} ||= get_plat_prefix();
 if(!$CFG{"plat-prefix"}) {
@@ -749,55 +731,37 @@ if(!$CFG{"v4-defaultroute-advmss"} and cfgint("v4-defaultroute-mtu")) {
 }
 
 #
-# Step 1: Detect if there is an IPv4 default route on the system from before.
-# If so we have no need for 464XLAT, and we can just exit straight away
-#
-if(cfgbool("v4-conncheck-enable") and !cfgbool("v4-defaultroute-replace")) {
-  my $delay = cfgint("v4-conncheck-delay");
-  p("Checking if this system already has IPv4 connectivity ",
-    $delay ? "in $delay sec(s)" : "now");
-  sleep($delay);
-  open(my $fd, '-|', cfg("cmd-ip"), qw(-4 route list default))
-    or err("'", cfg("cmd-ip"), " -4 route list default' failed to execute");
-  while(<$fd>) {
-    if(/^default /) {
-      p("This system already has IPv4 connectivity; no need for a CLAT.");
-      cleanup_and_exit(0);
-    }
-  }
-  close($fd) or err("cmd(ip -4 route list default) failed");
-} else {
-  d("Skipping IPv4 connectivity check at user request");
-}
-
-
-
-#
-# Write out the TAYGA config file, either to the user-specified location,
+# Write out the jool config file, either to the user-specified location,
 # or to a temporary file (which we'll delete later)
 #
-my $tayga_conffile = cfg("tayga-conffile");
-my $tayga_conffile_fh;
-if(!$tayga_conffile) {
+my $jool_conffile = cfg("jool-conffile");
+my $jool_conffile_fh;
+if(!$jool_conffile) {
   require File::Temp;
-  ($tayga_conffile_fh, $tayga_conffile) = File::Temp::tempfile();
-  d2("Using temporary conffile for TAYGA: $tayga_conffile");
-  $CFG{"tayga-conffile"} = $tayga_conffile;
-  $cleanup_delete_taygaconf = 1;
+  ($jool_conffile_fh, $jool_conffile) = File::Temp::tempfile();
+  d2("Using temporary conffile for jool: $jool_conffile");
+  $CFG{"jool-conffile"} = $jool_conffile;
 } else {
-  open($tayga_conffile_fh, ">$tayga_conffile") or
-    err("Could not open TAYGA config file '$tayga_conffile' for writing");
+  open($jool_conffile_fh, ">$jool_conffile") or
+    err("Could not open jool config file '$jool_conffile' for writing");
 }
 
-print $tayga_conffile_fh "# Ephemeral TAYGA config file written by $0\n";
-print $tayga_conffile_fh "# This file may be safely deleted at any time.\n";
-print $tayga_conffile_fh "tun-device ", cfg("clat-dev"), "\n";
-print $tayga_conffile_fh "prefix ", cfg("plat-prefix"), "\n";
-print $tayga_conffile_fh "ipv4-addr ", cfg("tayga-v4-addr"), "\n";
-print $tayga_conffile_fh "map ", cfg("clat-v4-addr"), " ",
-                         cfg("clat-v6-addr"),"\n";
+# TODO: allow reading arbitrary configs as default?
+my $jool_conf = {
+  instance => "default",
+  framework => "netfilter",
+  global => {
+    pool6 => cfg("plat-prefix"),
+  },
+  eamt => [{
+    "ipv6 prefix" => cfg("clat-v6-addr"),
+    "ipv4 prefix" => cfg("host-v4-addr")
+  }]
+};
 
-close($tayga_conffile_fh) or err("close($tayga_conffile_fh: $!");
+print $jool_conffile_fh (encode_json $jool_conf);
+
+close($jool_conffile_fh) or err("close($jool_conffile_fh: $!");
 
 #
 # Enable IPv6 forwarding if necessary
@@ -815,11 +779,9 @@ if(cfgbool("forwarding-enable")) {
         d("Changing $ctl from 1 to 2 to prevent connectivity loss after ",
           "enabling IPv6 forwarding");
         sysctl($ctl, 2);
-        push(@cleanup_accept_ra_sysctls, $ctl);
       }
     }
     sysctl("net/ipv6/conf/all/forwarding", 1);
-    $cleanup_zero_forwarding_sysctl = 0;
   }
 }
 
@@ -833,7 +795,6 @@ if(cfgbool("ip6tables-enable")) {
       "-o", cfg("plat-dev"), qw(-j ACCEPT));
   cmd(\&w, cfg("cmd-ip6tables"), qw(-I FORWARD -i), cfg("plat-dev"),
       "-o", cfg("clat-dev"), qw(-j ACCEPT));
-  $cleanup_remove_ip6tables_rules = 1;
 }
 
 #
@@ -845,41 +806,28 @@ if(cfgbool("proxynd-enable")) {
   p("Enabling Proxy-ND for $clat_v6_addr on $plat_dev");
   if(sysctl("net/ipv6/conf/$plat_dev/proxy_ndp") == 0) {
     sysctl("net/ipv6/conf/$plat_dev/proxy_ndp", 1);
-    $cleanup_zero_proxynd_sysctl = 1;
     d("Enabled Proxy-ND sysctl for $plat_dev");
   }
   cmd(\&w, cfg("cmd-ip"), qw(-6 neighbour add proxy), cfg("clat-v6-addr"),
       "dev", cfg("plat-dev"));
-
-  $cleanup_remove_proxynd_entry = 1;
 }
+
+p("Configuring jool atomically...");
+cmd(\&err, "modprobe", "jool_siit");
+cmd(\&err, cfg("cmd-ip"), qw(netns exec), cfg("netns"), qw(jool_siit file handle), cfg("jool-conffile"), "--force");
 
 #
 # Create the CLAT tun interface, add the IPv4 address to it as well as the
 # route to the corresponding IPv6 address, and possibly an IPv4 default route
 #
-p("Creating and configuring up CLAT device '", cfg("clat-dev"), "'");
-cmd(\&err, cfg("cmd-tayga"), "--config", cfg("tayga-conffile"), "--mktun",
-    cfgint("debug") ? "-d" : "");
-$cleanup_remove_clat_dev = 1;
-cmd(\&err, cfg("cmd-ip"), qw(link set up dev), cfg("clat-dev"));
-cmd(\&err, cfg("cmd-ip"), qw(-4 address add), cfg("clat-v4-addr"),
-    "dev", cfg("clat-dev"));
-cmd(\&err, cfg("cmd-ip"), qw(-6 route add), cfg("clat-v6-addr"),
-    "dev", cfg("clat-dev"));
-if(cfgbool("v4-defaultroute-replace")) {
-  open(my $fd, '-|', cfg("cmd-ip"), qw(-4 route show default))
-    or err("'ip -4 route show default' failed to execute");
-  while(<$fd>) {
-    my @rt = split(/\s+/, $_);
-    d("Replacing pre-existing IPv4 default route: @rt");
-    cmd(\&err, cfg("cmd-ip"), qw(-4 route del), @rt);
-    push(@cleanup_restore_v4_defaultroutes, \@rt);
-  }
-  close($fd) or err("'ip -4 route show default' failed");
-}
+cmd(\&w, cfg("cmd-ip"), qw(-4 address add dev), cfg("clat-dev"), cfg("host-v4-addr"), "peer", cfg("clat-v4-addr"));
+cmd(\&w, cfg("cmd-ip"), qw(-6 route add dev), cfg("clat-dev"), cfg("clat-v6-addr") . "/128");
+cmd(\&w, cfg("cmd-ip"), "-n", cfg("netns"), qw(-4 address add dev to_world), cfg("clat-v4-addr"), "peer", cfg("host-v4-addr"));
+cmd(\&w, cfg("cmd-ip"), "-n", cfg("netns"), qw(-6 address add dev to_world), cfg("clat-v6-addr") . "/128");
+cmd(\&w, cfg("cmd-ip"), "-n", cfg("netns"), qw(-6 route add), qw(default via), cfg("host-ll-addr"), qw(dev to_world));
+
 if(cfgbool("v4-defaultroute-enable")) {
-  my @cmdline = (qw(-4 route add default dev), cfg("clat-dev"));
+  my @cmdline = (qw(-4 route replace default dev), cfg("clat-dev"), "via", cfg("clat-v4-addr"));
   if(cfgint("v4-defaultroute-metric")) {
     push(@cmdline, ("metric", cfgint("v4-defaultroute-metric")))
   }
@@ -904,32 +852,3 @@ if(cfg("script-up")) {
   d("Running custom startup script: ", cfg("script-up"));
   cmd(\&err, cfg("script-up"));
 }
-
-#
-# All preparation done! We can now start TAYGA, which will handle the actual
-# translation of IP packets.
-#
-p("Starting up TAYGA, using config file '$tayga_conffile'");
-
-# We don't want systemd etc. to actually kill this script when stopping the
-# service, just TAYGA (so that we can get around to cleaning up after
-# ourselves)
-$SIG{'INT'} = 'IGNORE';
-$SIG{'TERM'} = 'IGNORE';
-
-cmd(\&err, cfg("cmd-tayga"), "--config", cfg("tayga-conffile"), "--nodetach",
-    cfgint("debug") ? "-d" : "");
-p("TAYGA terminated, cleaning up and exiting");
-
-$SIG{'INT'} = 'DEFAULT';
-$SIG{'TERM'} = 'DEFAULT';
-
-#
-# TAYGA exited, probably because we're shutting down. Run the down script, then
-# cleanup and exit.
-#
-if(cfg("script-down")) {
-  d("Running custom shutdown script: ", cfg("script-down"));
-  cmd(\&err, cfg("script-down"));
-}
-cleanup_and_exit(0);
