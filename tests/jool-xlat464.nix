@@ -2,7 +2,7 @@
   name = "jool-xlat464";
   nodes = {
     clat = { self, config, lib, pkgs, ... }: {
-      # imports = [ self.nixosModules.default ];
+      imports = [ self.nixosModules.jool-clat ];
       virtualisation.vlans = [ 1 ];
       networking = {
         useNetworkd = true;
@@ -23,12 +23,15 @@
           DNSSEC = false;
         };
       };
-      environment.systemPackages = [ pkgs.dig self.packages.${pkgs.stdenv.hostPlatform.system}.clatd ];
-      boot.extraModulePackages = with config.boot.kernelPackages; [ jool ];
+      services.jool-clat = {
+        enable = true;
+        networkd-integration = true;
+      };
     };
 
-    plat = { config, pkgs, ... }: {
+    plat = { self, config, pkgs, ... }: {
       virtualisation.vlans = [ 1 2 ];
+      imports = [ self.nixosModules.jool-nat64 ];
       networking = {
         useNetworkd = true;
         useDHCP = false;
@@ -44,19 +47,7 @@
           address = [ "172.16.0.64/24" ];
         };
       };
-      boot.extraModulePackages = with config.boot.kernelPackages; [ jool ];
-      systemd.services.jool = {
-        serviceConfig = {
-          ExecStartPre = "${pkgs.kmod}/bin/modprobe jool";
-          ExecStart =
-            "${pkgs.jool-cli}/bin/jool instance add default --netfilter --pool6 64:ff9b::/96";
-          ExecStop = "${pkgs.jool-cli}/bin/jool instance remove default";
-          Type = "oneshot";
-          RemainAfterExit = true;
-        };
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network.target" ];
-      };
+      services.jool-nat64.enable = true;
       services.unbound = {
         enable = true;
         settings = {
@@ -91,7 +82,6 @@
     plat.start()
     plat.wait_for_unit("systemd-networkd-wait-online.service")
     legacy.wait_for_unit("systemd-networkd-wait-online.service")
-    plat.wait_for_unit("jool.service");
     plat.wait_for_unit("unbound.service");
 
     # test network connectivity to legacy
@@ -103,7 +93,6 @@
     clat.succeed("ping -c 1 64:ff9b::172.16.0.2")
 
     # test whether clat can reach legacy over xlat464
-    print(clat.succeed("sudo clatd -d -d"))
     clat.succeed("ping -c 1 172.16.0.2")
   '';
 }

@@ -34,7 +34,7 @@
             postFixup = ''
               wrapProgram $out/bin/clatd \
                 --prefix PERL5LIB : $PERL5LIB \
-                --prefix PATH : ${lib.makeBinPath [ sysctl jool-cli iproute2 ]}
+                --prefix PATH : ${lib.makeBinPath [ kmod jool-cli iproute2 ]}
             '';
           };
         packages.default = packages.clatd;
@@ -44,6 +44,7 @@
           inputsFrom = [ packages.clatd ];
         };
       }) // {
-        nixosModules.default = ./nixos-module.nix;
+        nixosModules.jool-clat = import ./nixos-modules/jool-clat.nix self;
+        nixosModules.jool-nat64 = import ./nixos-modules/jool-nat64.nix;
       };
 }
