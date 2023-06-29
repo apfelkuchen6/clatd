@@ -42,6 +42,7 @@
           import ./tests/jool-xlat464.nix { inherit pkgs self; };
         devShells.default = pkgs.mkShell {
           inputsFrom = [ packages.clatd ];
+          nativeBuildInputs = [ pkgs.jool-cli ];
         };
       }) // {
         nixosModules.jool-clat = import ./nixos-modules/jool-clat.nix self;
