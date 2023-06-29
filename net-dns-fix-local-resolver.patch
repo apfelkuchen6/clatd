@@ -1,0 +1,22 @@
+diff --git a/lib/Net/DNS/Resolver/Base.pm b/lib/Net/DNS/Resolver/Base.pm
+index 49af98f..dad9cfd 100644
+--- a/lib/Net/DNS/Resolver/Base.pm
++++ b/lib/Net/DNS/Resolver/Base.pm
+@@ -873,6 +873,7 @@ sub _create_tcp_socket {
+ 		PeerPort  => $self->{port},
+ 		Proto	  => 'tcp',
+ 		Timeout	  => $self->{tcp_timeout},
++		GetAddrInfoFlags => 0
+ 		)
+ 			if USE_SOCKET_IP;
+ 
+@@ -906,7 +907,8 @@ sub _create_udp_socket {
+ 		LocalAddr => $ip6_addr ? $self->{srcaddr6} : $self->{srcaddr4},
+ 		LocalPort => $self->{srcport},
+ 		Proto	  => 'udp',
+-		Type	  => SOCK_DGRAM
++		Type	  => SOCK_DGRAM,
++		GetAddrInfoFlags => 0
+ 		)
+ 			if USE_SOCKET_IP;
+ 

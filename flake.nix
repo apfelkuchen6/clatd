@@ -18,7 +18,12 @@
             src = inputs.self;
 
             nativeBuildInputs = [ makeWrapper ];
-            buildInputs = with perlPackages; [ perl NetDNS NetIP ];
+            buildInputs = with perlPackages; [
+              perl
+              (NetDNS.overrideAttrs
+                (_: { patches = [ ./net-dns-fix-local-resolver.patch ]; }))
+              NetIP
+            ];
 
             makeFlags = [ "PREFIX=$(out)" ];
 
