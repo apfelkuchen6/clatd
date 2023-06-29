@@ -57,6 +57,7 @@ $CFG{"v4-defaultroute-enable"} = 1;	# add a v4 defaultroute via the CLAT?
 $CFG{"v4-defaultroute-metric"} = 2048;	# metric for the IPv4 defaultroute
 $CFG{"v4-defaultroute-mtu"} = 1260;	# MTU for the IPv4 defaultroute
 $CFG{"v4-defaultroute-advmss"} = 0;	# TCP MSS for the IPv4 defaultroute
+$CFG{"deconfigure"} = 0; # whether to exit immediately (for cleanup)
 
 
 #
@@ -615,6 +616,10 @@ for (my $i = 0; $i < @ARGV;) {
     undef(&readconf);
     splice(@ARGV, $i, 2);
     next;
+  } elsif($ARGV[$i] eq "stop") {
+    $CFG{"deconfigure"} = 1;
+    splice(@ARGV, $i, 1);
+    next;
   } elsif($ARGV[$i] =~ /^(-h|--help)$/) {
     print <<"EOF";
 clatd v$VERSION - a 464XLAT (RFC 6877) CLAT and SIIT-DC Edge Relay
@@ -663,6 +668,13 @@ for (@ARGV) {
 d("Configuration successfully read, dumping it:");
 for my $key (sort(keys(%CFG))) {
   d("  $key=", defined($CFG{$key}) ? $CFG{$key} : "<undefined>");
+}
+
+#
+# stop flag was passed explicity on the command line
+#
+if(cfg("deconfigure")) {
+    cleanup_and_exit(0);
 }
 
 p("Starting clatd v$VERSION by Tore Anderson <tore\@fud.no>");

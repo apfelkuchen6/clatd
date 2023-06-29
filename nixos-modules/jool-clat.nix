@@ -72,6 +72,8 @@ in {
         Type = "oneshot";
         ExecStart = "${cfg.package}/bin/clatd -c ${configFile}";
         ExecReload = "${cfg.package}/bin/clatd -c ${configFile}";
+        ExecStop = "${cfg.package}/bin/clatd -c ${configFile} stop";
+        RemainAfterExit = true;
 
         CapabilityBoundingSet = [
           "CAP_NET_ADMIN" # network configuration
